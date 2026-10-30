@@ -1,0 +1,16 @@
+# Phase 1 parameters. Costs, risk controls and execution belong to later phases.
+paper_mode: true
+random_seed: 42
+symbols: [EURUSD]
+data:
+  base_timeframe: H1
+  entry_timeframe: H4
+  trend_timeframe: D1
+strategy:
+  ema_fast_period: 50
+  ema_slow_period: 200
+  adx_period: 14
+  adx_threshold: 18
+  atr_period: 14
+  donchian_entry_period: 20
+  donchian_exit_period: 10
