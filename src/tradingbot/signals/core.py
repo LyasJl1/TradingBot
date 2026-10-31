@@ -58,19 +58,18 @@ def _closed_candles(frame: pd.DataFrame, timeframe: str, as_of: pd.Timestamp) ->
     frequency = {"H4": "4h", "D1": "1D"}[timeframe]
     if not frame.index.equals(frame.index.floor(frequency)):
         raise ValueError(f"{timeframe} candle open times must align to UTC boundaries")
-    columns = ["open", "high", "low", "close", "volume"]
+    columns = ["open", "high", "low", "close"]
     if not set(columns).issubset(frame.columns):
-        raise ValueError(f"{timeframe} candles require OHLCV columns")
+        raise ValueError(f"{timeframe} candles require OHLC columns")
     closed = frame.loc[frame.index + pd.Timedelta(frequency) <= as_of, columns].copy()
     if not np.isfinite(closed.to_numpy(dtype=float)).all():
-        raise ValueError(f"{timeframe} OHLCV must be finite")
+        raise ValueError(f"{timeframe} OHLC must be finite")
     if ((closed[["open", "high", "low", "close"]] <= 0).any().any()
-            or (closed.volume < 0).any()
             or (closed.high < closed[["open", "close", "low"]].max(axis=1)).any()
             or (closed.low > closed[["open", "close", "high"]].min(axis=1)).any()):
-        raise ValueError(f"{timeframe} invalid OHLCV")
-    if len(closed) > 1 and not (closed.index.to_series().diff().iloc[1:] == pd.Timedelta(frequency)).all():
-        raise ValueError(f"{timeframe} candles contain gaps")
+        raise ValueError(f"{timeframe} invalid OHLC")
+    # Missing market periods and dropped sparse buckets are not manufactured.
+    # Indicators run over retained observations, not filled calendar slots.
     return closed
 
 
@@ -143,5 +142,9 @@ def generate_signals(
     No wall clock, I/O, account access, randomness, filters, risk or execution.
     All decision reasons and the underlying aligned indicator values are returned.
     """
-    frames = build_timeframes(base, config.data.base_timeframe, as_of=as_of)
+    frames = build_timeframes(
+        base, config.data.base_timeframe, as_of=as_of,
+        min_base_candles_per_h4=config.data.min_base_candles_per_h4,
+        min_base_candles_per_d1=config.data.min_base_candles_per_d1,
+    )
     return evaluate_candles(frames["H4"], frames["D1"], config.strategy, as_of=as_of)

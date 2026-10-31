@@ -52,6 +52,39 @@ D10. Broker: MetaTrader 5 (Windows). Default symbol EURUSD; symbol list
 D11. Timestamps: all UTC. Day boundaries for risk limits are UTC.
 D12. Account currency: configurable. Convert risk into account currency
      where needed.
+D13. Phase 1 real-data compatibility: Dukascopy H1 input is a BID/ASK
+     pair at data/raw/{SYMBOL}_H1_bid.csv and
+     data/raw/{SYMBOL}_H1_ask.csv, with timestamp, open, high, low, close.
+     Numeric timestamps are Unix epoch MILLISECONDS, converted to
+     timezone-aware UTC. Explicit UTC ISO timestamps remain supported.
+     Volume is optional and unused; never require it or fabricate it.
+D14. Verify identical raw BID/ASK row counts and timestamps BEFORE
+     filtering; fail clearly on mismatch. Candles use BID OHLC only.
+     Per-base-candle spread = ASK close - BID close, in price units.
+     This is a close-based estimate, not an executable bid/ask spread
+     at the next H4 open. Do not assume missing spread is zero.
+D15. Weekend/holiday and other missing periods are allowed and NEVER
+     filled. Build H4/D1 from existing retained base candles at UTC
+     boundaries. Config data.min_base_candles_per_h4 = 2 and
+     data.min_base_candles_per_d1 = 12. Drop/count buckets below these
+     minima, including empty buckets inside the observed span. A bucket
+     must still be fully closed by as_of even when the minimum is met.
+D16. Drop/count flat base BID candles (open = high = low = close).
+     Keep ASK aligned using the same BID keep mask; never independently
+     filter the two sides before checking timestamp identity. Volume
+     is ignored. Indicators operate on retained candles, without fillers.
+D17. Report gaps without failing/filling. A gap starts at the first
+     missing expected base open (previous observed open + base period)
+     and ends at the next observed open. Its duration is that missing
+     interval. Gaps LONGER than 4 hours whose start is Monday-Friday UTC
+     appear in the warning list. All gaps, including weekend gaps, are
+     counted/reported. Ordering, duplicates, off-grid timestamps, invalid
+     OHLC and invalid supplied/derived spreads still fail validation.
+D18. Provide a Phase 1 data-quality command reporting per-symbol raw
+     BID/ASK row counts, retained rows, first/last UTC timestamps, flat
+     candles dropped, all gaps and warnings, and H4/D1 built/dropped
+     counts. Distinguish below-minimum drops from unclosed buckets.
+     Raw files in data/raw/ and CSV data are not committed.
 
 ## 2. STRATEGY (exact)
 
@@ -135,9 +168,12 @@ committed or logged.
 
 ## 5. BACKTEST REQUIREMENTS
 
-- Input: CSV/Parquet OHLCV (+ optional spread), UTC. Validate columns,
-  ordering, duplicates, missing candles, OHLC consistency. Fail clearly if
-  the base timeframe can't support H4/D1 resampling.
+- Input: CSV/Parquet OHLC (+ optional unused volume and optional spread),
+  UTC, including paired Dukascopy H1 files per D13-D18. Validate columns,
+  ordering, duplicates, grid alignment and OHLC consistency; report gaps
+  without filling or failing solely because of gaps. Drop flat base
+  candles and insufficient H4/D1 buckets using the configured minima.
+  Fail clearly if the base timeframe can't support H4/D1 resampling.
 - Event order per H4 candle: process existing positions/stops -> apply
   gap and intrabar rules -> update fills, costs, equity -> evaluate the
   closed candle -> apply filters and risk -> schedule entry for next open.
@@ -185,6 +221,11 @@ PHASE 1: data + resampling + indicators + signals + tests.
   comparisons. CRITICAL no-lookahead test: compute signals on full data,
   truncate future data after a chosen point, recompute; all earlier
   signals must be identical (cover channels, ATR, D1 filter, alignment).
+  Real-data patch tests: epoch-ms and ISO parsing, optional/unused volume,
+  raw BID/ASK identity checks, BID prices and close-spread estimate,
+  unfilled gaps and weekday warnings, flat/drop counts, configurable
+  minimum coverage and closed-bucket timing, data-quality command.
+  Repeat the full suite, including no-lookahead checks on gappy data.
   No backtest, risk or execution code yet.
 
 PHASE 2: backtest engine, costs (incl. swap), metrics, reports, 70/30

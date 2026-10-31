@@ -13,12 +13,22 @@ class DataConfig:
     base_timeframe: str
     entry_timeframe: str
     trend_timeframe: str
+    min_base_candles_per_h4: int
+    min_base_candles_per_d1: int
 
     def __post_init__(self) -> None:
         if self.base_timeframe not in {"M15", "H1"}:
             raise ValueError("base_timeframe must be M15 or H1")
         if self.entry_timeframe != "H4" or self.trend_timeframe != "D1":
             raise ValueError("The specified strategy requires H4 entries and D1 trend candles")
+        base_candles_per_hour = {"M15": 4, "H1": 1}[self.base_timeframe]
+        for name, capacity in (
+            ("min_base_candles_per_h4", 4 * base_candles_per_hour),
+            ("min_base_candles_per_d1", 24 * base_candles_per_hour),
+        ):
+            minimum = getattr(self, name)
+            if type(minimum) is not int or not 1 <= minimum <= capacity:
+                raise ValueError(f"{name} must be an integer in [1, {capacity}] for {self.base_timeframe}")
 
 
 @dataclass(frozen=True)
