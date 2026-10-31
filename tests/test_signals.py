@@ -107,6 +107,34 @@ def test_no_completed_candles_returns_empty_decision_table() -> None:
     assert {"direction", "reason", "signal_time", "entry_time", "atr"}.issubset(result.columns)
 
 
+def test_signal_evaluator_volume_is_optional_and_unused() -> None:
+    h4 = candles("2024-01-01", 54, "4h")
+    d1 = candles("2024-01-01", 9, "D")
+    as_of = pd.Timestamp("2024-01-10T00:00Z")
+    expected = evaluate_candles(h4, d1, small_strategy(), as_of=as_of)
+    assert_frame_equal(
+        evaluate_candles(h4.drop(columns="volume"), d1.drop(columns="volume"),
+                         small_strategy(), as_of=as_of), expected,
+    )
+    assert_frame_equal(
+        evaluate_candles(h4.assign(volume="unused"), d1.assign(volume=np.nan),
+                         small_strategy(), as_of=as_of), expected,
+    )
+
+
+def test_signal_evaluator_accepts_h4_and_d1_market_gaps_without_filling() -> None:
+    h4 = candles("2024-01-01", 54, "4h").drop(columns="volume")
+    d1 = candles("2024-01-01", 9, "D").drop(columns="volume")
+    # Remove Saturday and Sunday entirely from each internally built timeframe.
+    h4 = h4.loc[h4.index.dayofweek < 5]
+    d1 = d1.loc[d1.index.dayofweek < 5]
+    result = evaluate_candles(h4, d1, small_strategy(), as_of=pd.Timestamp("2024-01-10T00:00Z"))
+    assert result.index.equals(h4.index)
+    assert not (result.index.dayofweek >= 5).any()
+    assert (result.direction == "long").any()
+    assert result.loc[pd.Timestamp("2024-01-08T00:00Z"), "d1_open"] == pd.Timestamp("2024-01-05T00:00Z")
+
+
 @pytest.mark.parametrize("cutoff", ["2024-01-10", "2024-01-10T00:00+01:00", pd.NaT])
 def test_evaluation_rejects_ambiguous_cutoff(cutoff) -> None:
     with pytest.raises(ValueError, match="UTC|NaT"):

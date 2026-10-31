@@ -6,6 +6,9 @@ data:
   base_timeframe: H1
   entry_timeframe: H4
   trend_timeframe: D1
+  # Count retained base candles; never fill weekend/holiday/missing bars.
+  min_base_candles_per_h4: 2
+  min_base_candles_per_d1: 12
 strategy:
   ema_fast_period: 50
   ema_slow_period: 200

@@ -1,9 +1,11 @@
-"""Data ingestion and conservative candle construction, with no broker access."""
+"""Validated UTC OHLC data, paired BID/ASK loading and unfilled resampling."""
 
 from __future__ import annotations
 
 import logging
+from numbers import Real
 from pathlib import Path
+import re
 
 import numpy as np
 import pandas as pd
@@ -11,7 +13,7 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 _BASE_PERIODS = {"M15": pd.Timedelta(minutes=15), "H1": pd.Timedelta(hours=1)}
 _TARGET_PERIODS = {"H4": pd.Timedelta(hours=4), "D1": pd.Timedelta(days=1)}
-_OHLCV = ("open", "high", "low", "close", "volume")
+_OHLC = ["open", "high", "low", "close"]
 _UTC_NAMES = {"UTC", "Etc/UTC", "Etc/GMT", "GMT", "UTC+00:00", "+00:00"}
 
 
@@ -38,62 +40,61 @@ def _validate_index(frame: pd.DataFrame) -> None:
         raise CandleValidationError("candle timestamps must be ordered, oldest first")
 
 
-def validate_base_candles(frame: pd.DataFrame, base_timeframe: str) -> pd.DataFrame:
-    """Return a validated copy without sorting, filling, or repairing input.
-
-    A continuous base-timeframe grid is required. Even a scheduled market closure
-    is reported as missing data, because no exchange calendar is assumed here.
-    Volume and optional spread must be finite and nonnegative. Missing spread
-    remains absent; this layer supplies no cost defaults.
-    """
+def _validated_raw(frame: pd.DataFrame, base_timeframe: str, *, allow_empty: bool = False) -> pd.DataFrame:
     period = _base_period(base_timeframe)
     if not isinstance(frame, pd.DataFrame):
         raise CandleValidationError("candles must be a pandas DataFrame")
-    if frame.empty:
+    if frame.empty and not allow_empty:
         raise CandleValidationError("base candle data is empty")
     _validate_index(frame)
     if frame.columns.has_duplicates:
         raise CandleValidationError("duplicate candle columns")
-    missing = set(_OHLCV).difference(frame.columns)
+    missing = set(_OHLC).difference(frame.columns)
     if missing:
-        raise CandleValidationError(f"missing OHLCV columns: {', '.join(sorted(missing))}")
+        raise CandleValidationError(f"missing OHLC columns: {', '.join(sorted(missing))}")
     if not frame.index.equals(frame.index.floor(period)):
         raise CandleValidationError(f"timestamps are not aligned to UTC {base_timeframe} boundaries")
-    differences = frame.index.to_series().diff().iloc[1:]
-    bad_gaps = differences[differences != period]
-    if not bad_gaps.empty:
-        first = bad_gaps.index[0]
-        raise CandleValidationError(
-            f"missing base candles before {first.isoformat()}: "
-            f"expected {period}, found {bad_gaps.iloc[0]}; no market calendar is assumed"
-        )
-    columns = list(_OHLCV) + (["spread"] if "spread" in frame else [])
+    columns = _OHLC + (["spread"] if "spread" in frame else [])
+    result = frame.loc[:, columns].copy()
     for name in columns:
-        series = frame[name]
-        if (
-            not pd.api.types.is_numeric_dtype(series)
-            or pd.api.types.is_bool_dtype(series)
-            or pd.api.types.is_complex_dtype(series)
-        ):
+        series = result[name]
+        if (not pd.api.types.is_numeric_dtype(series)
+                or pd.api.types.is_bool_dtype(series)
+                or pd.api.types.is_complex_dtype(series)):
             raise CandleValidationError(f"{name} must contain numeric values")
-        if not np.isfinite(series.to_numpy(dtype=float)).all():
+        if not np.isfinite(series.to_numpy(dtype=float, na_value=np.nan)).all():
             raise CandleValidationError(f"{name} contains missing or nonfinite values")
-    if (frame["volume"] < 0).any():
-        raise CandleValidationError("volume must be nonnegative")
-    if "spread" in frame and (frame["spread"] < 0).any():
+    if "spread" in result and (result.spread < 0).any():
         raise CandleValidationError("spread must be nonnegative when supplied")
-    invalid_ohlc = (
-        (frame["high"] < frame["low"])
-        | (frame["high"] < frame["open"])
-        | (frame["high"] < frame["close"])
-        | (frame["low"] > frame["open"])
-        | (frame["low"] > frame["close"])
-    )
-    if invalid_ohlc.any():
-        timestamp = frame.index[invalid_ohlc][0]
-        raise CandleValidationError(f"inconsistent OHLC at {timestamp.isoformat()}")
-    result = frame.copy()
+    invalid = ((result.high < result.low) | (result.high < result.open)
+               | (result.high < result.close) | (result.low > result.open)
+               | (result.low > result.close))
+    if invalid.any():
+        raise CandleValidationError(f"inconsistent OHLC at {result.index[invalid][0].isoformat()}")
     result.index = result.index.tz_convert("UTC").rename("timestamp")
+    return result
+
+
+def validate_base_candles(frame: pd.DataFrame, base_timeframe: str) -> pd.DataFrame:
+    """Validate and drop flat BID rows. Gaps are allowed; volume is ignored.
+
+    Metadata retains original row counts and timestamp bounds across repeated
+    validation. No missing prices, rows, volume or spread are invented.
+    """
+    prior = dict(frame.attrs.get("data_quality", {})) if isinstance(frame, pd.DataFrame) else {}
+    raw = _validated_raw(frame, base_timeframe, allow_empty=bool(prior.get("input_rows", 0)))
+    metadata = prior or {
+        "input_rows": len(raw), "flat_candles_dropped": 0,
+        "first_timestamp": raw.index[0].isoformat() if len(raw) else None,
+        "last_timestamp": raw.index[-1].isoformat() if len(raw) else None,
+    }
+    flat = raw[_OHLC].eq(raw.close, axis=0).all(axis=1)
+    count = int(flat.sum())
+    metadata["flat_candles_dropped"] = int(metadata.get("flat_candles_dropped", 0)) + count
+    result = raw.loc[~flat].copy()
+    result.attrs["data_quality"] = metadata
+    if count:
+        LOGGER.info("base_candles_dropped reason=flat_bid count=%d", count)
     return result
 
 
@@ -101,23 +102,33 @@ def _timestamp_index(values: pd.Series) -> pd.DatetimeIndex:
     parsed: list[pd.Timestamp] = []
     for value in values:
         try:
-            timestamp = pd.Timestamp(value)
-        except (TypeError, ValueError) as error:
-            raise CandleValidationError("timestamp column contains an invalid timestamp") from error
-        if pd.isna(timestamp) or timestamp.tzinfo is None:
-            raise CandleValidationError("timestamp column must contain explicitly UTC timestamps")
-        if timestamp.utcoffset() != pd.Timedelta(0):
-            raise CandleValidationError("timestamp column contains a non-UTC offset")
-        parsed.append(timestamp.tz_convert("UTC"))
+            numeric = isinstance(value, Real) and not isinstance(value, (bool, np.bool_))
+            numeric_text = isinstance(value, str) and bool(re.fullmatch(r"[+-]?\d+", value))
+            if numeric or numeric_text:
+                number = float(value)
+                if not np.isfinite(number) or not number.is_integer():
+                    raise CandleValidationError("epoch-millisecond timestamps must be finite integers")
+                timestamp = pd.to_datetime(int(value), unit="ms", utc=True)
+            else:
+                if isinstance(value, (bool, np.bool_)):
+                    raise CandleValidationError("boolean timestamp is invalid")
+                timestamp = pd.Timestamp(value)
+                if pd.isna(timestamp) or timestamp.tzinfo is None:
+                    raise CandleValidationError("timestamp column must contain explicitly UTC timestamps")
+                if timestamp.utcoffset() != pd.Timedelta(0):
+                    raise CandleValidationError("timestamp column contains a non-UTC offset")
+                timestamp = timestamp.tz_convert("UTC")
+            if pd.isna(timestamp):
+                raise CandleValidationError("timestamp column contains NaT")
+            parsed.append(timestamp)
+        except (TypeError, ValueError, OverflowError) as error:
+            if isinstance(error, CandleValidationError):
+                raise
+            raise CandleValidationError("timestamp column contains an invalid UTC timestamp or epoch milliseconds") from error
     return pd.DatetimeIndex(parsed, tz="UTC", name="timestamp")
 
 
-def load_candles(path: str | Path, base_timeframe: str) -> pd.DataFrame:
-    """Load CSV or Parquet with timestamp and lowercase OHLCV columns.
-
-    CSV timestamps must include Z or +00:00; naive timestamps are never assumed
-    to be UTC. Parquet may alternatively store a named UTC DatetimeIndex.
-    """
+def _read_candles(path: str | Path, base_timeframe: str) -> pd.DataFrame:
     _base_period(base_timeframe)
     source = Path(path)
     try:
@@ -133,68 +144,123 @@ def load_candles(path: str | Path, base_timeframe: str) -> pd.DataFrame:
         frame.index = _timestamp_index(frame.pop("timestamp"))
     elif not isinstance(frame.index, pd.DatetimeIndex):
         raise CandleValidationError("candle file is missing the timestamp column")
-    return validate_base_candles(frame, base_timeframe)
+    return _validated_raw(frame, base_timeframe)
+
+
+def load_candles(path: str | Path, base_timeframe: str) -> pd.DataFrame:
+    """Load UTC epoch-ms/ISO OHLC CSV or Parquet; drop flats, ignore volume."""
+    return validate_base_candles(_read_candles(path, base_timeframe), base_timeframe)
+
+
+def load_bid_ask(bid_path: str | Path, ask_path: str | Path, base_timeframe: str) -> pd.DataFrame:
+    """Require identical RAW rows/times, use BID OHLC and ASK-close minus BID-close.
+
+    Spread is a close-based estimate in price units. The BID flat mask alone is
+    applied AFTER pairing; no unmatched dates are intersected or repaired.
+    """
+    bid = _read_candles(bid_path, base_timeframe)
+    ask = _read_candles(ask_path, base_timeframe)
+    if len(bid) != len(ask):
+        raise CandleValidationError(f"Bid/Ask row count mismatch: bid={len(bid)}, ask={len(ask)}")
+    if not bid.index.equals(ask.index):
+        raise CandleValidationError("Bid/Ask timestamp mismatch: raw timestamp sequences must be identical")
+    merged = bid.loc[:, _OHLC].copy()
+    merged["spread"] = ask.close.to_numpy() - bid.close.to_numpy()
+    result = validate_base_candles(merged, base_timeframe)
+    result.attrs["data_quality"].update(bid_rows=len(bid), ask_rows=len(ask))
+    return result
+
+
+def find_gaps(frame: pd.DataFrame, base_timeframe: str) -> list[dict[str, object]]:
+    """Report missing intervals after cleaning, without filling or rejecting.
+
+    Start is the FIRST missing open; duration ends at the next observed open.
+    Warn only when this missing duration exceeds four hours and starts Mon-Fri.
+    """
+    period = _base_period(base_timeframe)
+    _validate_index(frame)
+    result: list[dict[str, object]] = []
+    for previous, following in zip(frame.index[:-1], frame.index[1:]):
+        if following - previous > period:
+            start = previous + period
+            duration = following - start
+            result.append({
+                "previous_timestamp": previous.isoformat(), "next_timestamp": following.isoformat(),
+                "start": start.isoformat(), "end": following.isoformat(),
+                "duration_hours": duration.total_seconds() / 3600,
+                "missing_base_candles": int(duration / period),
+                "warning": bool(duration > pd.Timedelta(hours=4) and start.dayofweek < 5),
+            })
+    return result
 
 
 def resample_candles(
-    frame: pd.DataFrame,
-    base_timeframe: str,
-    target_timeframe: str,
-    *,
-    as_of: pd.Timestamp,
+    frame: pd.DataFrame, base_timeframe: str, target_timeframe: str, *,
+    as_of: pd.Timestamp, min_base_candles: int,
 ) -> pd.DataFrame:
-    """Build complete closed H4 or D1 candles using UTC open labels.
+    """Aggregate existing closed base bars; minimum coverage never closes a bucket.
 
-    Incomplete leading/trailing groups and the currently forming candle are
-    omitted with a reason in the standard logger. Supplied future data is ignored.
-    Optional spread is the last base-candle observation, not an invented cost or
-    a guarantee about a later execution price.
+    Empty buckets inside original input bounds count as dropped. No OHLC rows are
+    manufactured. Metadata distinguishes below-minimum and not-yet-closed drops.
     """
-    base_period = _base_period(base_timeframe)
+    base = _base_period(base_timeframe)
     if target_timeframe not in _TARGET_PERIODS:
         raise CandleValidationError("target_timeframe must be H4 or D1")
-    try:
-        cutoff = pd.Timestamp(as_of)
-    except (TypeError, ValueError) as error:
-        raise CandleValidationError("as_of must be an explicit UTC timestamp") from error
-    if pd.isna(cutoff) or cutoff.tzinfo is None or str(cutoff.tz) not in _UTC_NAMES:
+    period = _TARGET_PERIODS[target_timeframe]
+    if type(min_base_candles) is not int or not 1 <= min_base_candles <= int(period / base):
+        raise CandleValidationError("min_base_candles must be a positive integer within bucket capacity")
+    cutoff = pd.Timestamp(as_of)
+    if pd.isna(cutoff) or cutoff.tzinfo is None or str(cutoff.tzinfo) not in _UTC_NAMES:
         raise CandleValidationError("as_of must be an explicit UTC timestamp")
     if not isinstance(frame, pd.DataFrame):
         raise CandleValidationError("candles must be a pandas DataFrame")
-    if frame.empty:
-        raise CandleValidationError("base candle data is empty")
     _validate_index(frame)
-    closed = frame.loc[frame.index + base_period <= cutoff]
-    if len(closed) != len(frame):
-        LOGGER.info("base_candles_omitted reason=not_closed_as_of count=%d as_of=%s", len(frame) - len(closed), cutoff.isoformat())
-    # Validate the schema even when as_of precedes all observations.
-    validated = validate_base_candles(closed if not closed.empty else frame.iloc[:1], base_timeframe)
-    if closed.empty:
-        return validated.iloc[:0].loc[:, list(_OHLCV) + (["spread"] if "spread" in validated else [])]
-    period = _TARGET_PERIODS[target_timeframe]
-    aggregation = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    if "spread" in validated:
+    metadata = frame.attrs.get("data_quality", {})
+    if frame.empty and not metadata.get("input_rows", 0):
+        raise CandleValidationError("base candle data is empty")
+    # Filter before reading values so future/forming base prices cannot leak in.
+    source = frame.loc[frame.index + base <= cutoff]
+    if source.empty:
+        cleaned = _validated_raw(source, base_timeframe, allow_empty=True)
+    else:
+        cleaned = validate_base_candles(source, base_timeframe)
+    first = pd.Timestamp(metadata.get("first_timestamp") or frame.index[0]) if len(frame) or metadata else None
+    last = pd.Timestamp(metadata.get("last_timestamp") or frame.index[-1]) if len(frame) or metadata else None
+    last_closed = cutoff.floor(base) - base
+    last = min(last, last_closed) if last is not None else None
+    buckets = (pd.date_range(first.floor(period), last.floor(period), freq=period, name="timestamp")
+               if first is not None and last is not None and last >= first else
+               pd.DatetimeIndex([], tz="UTC", name="timestamp"))
+    aggregation = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if "spread" in cleaned:
         aggregation["spread"] = "last"
-    groups = validated.resample(period, origin="epoch", closed="left", label="left")
-    result = groups.agg(aggregation)
-    counts = groups.size()
-    expected_count = int(period / base_period)
-    complete = (counts == expected_count) & (result.index + period <= cutoff)
-    for timestamp in result.index[~complete]:
-        LOGGER.info(
-            "target_candle_omitted reason=incomplete_or_not_closed timeframe=%s timestamp=%s count=%d expected=%d as_of=%s",
-            target_timeframe, timestamp.isoformat(), counts.loc[timestamp], expected_count, cutoff.isoformat(),
-        )
-    result = result.loc[complete].copy()
+    groups = cleaned.resample(period, origin="epoch", closed="left", label="left")
+    aggregated = groups.agg(aggregation).reindex(buckets)
+    counts = groups.size().reindex(buckets, fill_value=0)
+    closed = buckets + period <= cutoff
+    enough = counts >= min_base_candles
+    keep = closed & enough
+    result = aggregated.loc[keep].copy()
     result.index.name = "timestamp"
+    not_closed = int((~closed).sum())
+    below = int((closed & ~enough).sum())
+    result.attrs["resample_quality"] = {
+        "built": len(result), "dropped": not_closed + below,
+        "dropped_below_minimum": below, "dropped_not_closed": not_closed,
+    }
+    for timestamp in buckets[~keep]:
+        reason = "not_closed" if timestamp + period > cutoff else "below_minimum"
+        LOGGER.info("target_candle_omitted reason=%s timeframe=%s timestamp=%s count=%d minimum=%d",
+                    reason, target_timeframe, timestamp.isoformat(), counts.loc[timestamp], min_base_candles)
     return result
 
 
 def build_timeframes(
-    frame: pd.DataFrame, base_timeframe: str, *, as_of: pd.Timestamp
+    frame: pd.DataFrame, base_timeframe: str, *, as_of: pd.Timestamp,
+    min_base_candles_per_h4: int, min_base_candles_per_d1: int,
 ) -> dict[str, pd.DataFrame]:
-    """Use the same resampler for both strategy timeframes in every mode."""
+    """Use one resampler and explicit configured minima in every mode."""
     return {
-        target: resample_candles(frame, base_timeframe, target, as_of=as_of)
-        for target in _TARGET_PERIODS
+        target: resample_candles(frame, base_timeframe, target, as_of=as_of, min_base_candles=minimum)
+        for target, minimum in (("H4", min_base_candles_per_h4), ("D1", min_base_candles_per_d1))
     }

@@ -16,6 +16,8 @@ def test_spec_defaults_live_in_central_config() -> None:
     assert config.data.base_timeframe == "H1"
     assert config.data.entry_timeframe == "H4"
     assert config.data.trend_timeframe == "D1"
+    assert config.data.min_base_candles_per_h4 == 2
+    assert config.data.min_base_candles_per_d1 == 12
     assert vars(config.strategy) == {
         "ema_fast_period": 50, "ema_slow_period": 200,
         "adx_period": 14, "adx_threshold": 18,
@@ -34,6 +36,12 @@ def test_spec_defaults_live_in_central_config() -> None:
     ("data", "base_timeframe", "H4"),
     ("data", "entry_timeframe", "H1"),
     ("data", "trend_timeframe", "H4"),
+    ("data", "min_base_candles_per_h4", 0),
+    ("data", "min_base_candles_per_h4", True),
+    ("data", "min_base_candles_per_h4", 2.0),
+    ("data", "min_base_candles_per_h4", 5),
+    ("data", "min_base_candles_per_d1", -1),
+    ("data", "min_base_candles_per_d1", 25),
     ("strategy", "atr_period", 0),
     ("strategy", "adx_period", True),
     ("strategy", "ema_fast_period", 200),
